@@ -12,6 +12,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include "pc98_layout.h"
 
 using PhysPt = uintptr_t;
 
@@ -40,6 +41,7 @@ extern PhysPt am_loadaddress;
 
 extern bool amw7_pc98_mode;
 extern uintptr_t amw7_pc98_anchor;
+extern const W7PC98Layout* amw7_pc98_layout;
 
 bool mem_readb_checked(uintptr_t addr, uint8_t* out);
 bool mem_readw_checked(uintptr_t addr, uint16_t* out);

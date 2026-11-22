@@ -45,6 +45,7 @@ bool amw7_rus = false;
 static bool s_dataseg_scanned   = false;
 bool amw7_pc98_mode = false;
 uintptr_t amw7_pc98_anchor = 0;
+const W7PC98Layout* amw7_pc98_layout = &W7_PC9801_LAYOUT;
 extern int am_height;
 extern int am_width;
 #define SCREENH am_height
@@ -1253,16 +1254,32 @@ void W7_CopyVisData(uint16_t level){
 	amw7_level = blevel;
 }
 
+static bool W7_PC98MapBase(uintptr_t& mapbase)
+{
+	const auto& layout = *amw7_pc98_layout;
+	size_t offset = layout.fixedMap;
+	if (layout.mapPointer != 0) {
+		uint16_t pointer = 0;
+		if (!mem_readw_checked(amw7_pc98_anchor + layout.mapPointer, &pointer) ||
+			pointer < layout.filenameInDS ||
+			pointer > 0x10000u - W7_PC98_MAP_SIZE) return false;
+		offset = pointer - layout.filenameInDS;
+	}
+	if (offset > W7_PC98_SNAPSHOT_SIZE - W7_PC98_MAP_SIZE) return false;
+	mapbase = amw7_pc98_anchor + offset;
+	return true;
+}
+
 void W7_UpdateCache(uint16_t uArray){
 	if (amw7_current_level>31) {
 		return;
 	}
 
 	if (amw7_pc98_mode) {
-		// PC-9801 WIZ7.EXE external mode.
-		// amw7_pc98_anchor points at the DS.EXE resident data anchor ("a:ds.exe").
-		// The current level map data observed in dumps starts at anchor + 0xA708.
-		uintptr_t mapbase = amw7_pc98_anchor + 0xA708;
+		// PC-9821 allocates this block dynamically. Resolve the guest DS
+		// pointer in every snapshot, including after loading another level.
+		uintptr_t mapbase = 0;
+		if (!W7_PC98MapBase(mapbase)) return;
 		MEM_BlockRead(mapbase + 0x090, &amw7_cache_hwalls[amw7_current_level][0], sizeof(amw7_cache_hwalls)/W7_LEVEL_COUNT);
 		MEM_BlockRead(mapbase + 0x290, &amw7_cache_vwalls[amw7_current_level][0], sizeof(amw7_cache_vwalls)/W7_LEVEL_COUNT);
 		MEM_BlockRead(mapbase + 0x490, &amw7_cache_qsx[amw7_current_level][0], sizeof(amw7_cache_qsx)/W7_LEVEL_COUNT);
@@ -1273,12 +1290,8 @@ void W7_UpdateCache(uint16_t uArray){
 		MEM_BlockRead(mapbase + 0x930, &amw7_cache_floor1[amw7_current_level][0], sizeof(amw7_cache_floor1)/W7_LEVEL_COUNT);
 		MEM_BlockRead(mapbase + 0x9B0, &amw7_cache_floor2[amw7_current_level][0], sizeof(amw7_cache_floor2)/W7_LEVEL_COUNT);
 
-		// PC-9801 external mode: the loaded/save-restored visited-cell bitset
-		// is not inside the mapdata block.  Direction/position live around
-		// anchor+0x78xx/0x84xx, while the current map's visited cells are at
-		// anchor+0x80A4.  Without this read, loading a save can restore the
-		// position and map geometry but not the path already walked in-game.
-		MEM_BlockRead(amw7_pc98_anchor + 0x80A4,
+		// Visited cells live outside the map block in both PC-98 layouts.
+		MEM_BlockRead(amw7_pc98_anchor + amw7_pc98_layout->visited,
 		              &amw7_cache_visited_cells[amw7_current_level][0],
 		              sizeof(amw7_cache_visited_cells)/W7_LEVEL_COUNT);
 
@@ -2331,29 +2344,40 @@ void W7_PollState()
 		uint16_t absX = 0xFFFF;
 		uint16_t newDir = amw7_current_dir;
 
-		// PC-9801 WIZ7.EXE resident state offsets, derived by comparing
-		// DOS/V Automap RAM dumps with WIZ7.EXE RAM dumps.
-		// 0x84E6 is qY, not level.  The true map/level index is 0x84EE.
-		// Current facing direction is 0x785A.  0x84D6 is only the last
-		// movement direction and does not update when turning in place.
+		const auto& layout = *amw7_pc98_layout;
 		bool ok = true;
-		ok = mem_readw_checked((amw7_pc98_anchor + 0x84EE), &newLevel) && ok;
-		ok = mem_readw_checked((amw7_pc98_anchor + 0x84E4), &newQuadrant) && ok;
-		ok = mem_readw_checked((amw7_pc98_anchor + 0x84E8), &newQX) && ok;
-		ok = mem_readw_checked((amw7_pc98_anchor + 0x84E6), &newQY) && ok;
-		ok = mem_readw_checked((amw7_pc98_anchor + 0x84EA), &absY) && ok;
-		ok = mem_readw_checked((amw7_pc98_anchor + 0x84EC), &absX) && ok;
-		ok = mem_readw_checked((amw7_pc98_anchor + 0x785A), &newDir) && ok;
-		(void)absY;
-		(void)absX;
+		ok = mem_readw_checked(amw7_pc98_anchor + layout.level, &newLevel) && ok;
+		ok = mem_readw_checked(amw7_pc98_anchor + layout.quadrant, &newQuadrant) && ok;
+		ok = mem_readw_checked(amw7_pc98_anchor + layout.qX, &newQX) && ok;
+		ok = mem_readw_checked(amw7_pc98_anchor + layout.qY, &newQY) && ok;
+		ok = mem_readw_checked(amw7_pc98_anchor + layout.absY, &absY) && ok;
+		ok = mem_readw_checked(amw7_pc98_anchor + layout.absX, &absX) && ok;
+		ok = mem_readw_checked(amw7_pc98_anchor + layout.direction, &newDir) && ok;
 
 		if (!ok ||
 			newLevel >= W7_LEVEL_COUNT ||
 			newQuadrant >= W7_QUADRANT_COUNT ||
 			newQX >= 8 || newQY >= 8 ||
 			newDir > 3) {
+			if (layout.mapPointer != 0) amw7_current_level = 0xFFFF;
 			amw7_need_update_once = true;
 			return;
+		}
+
+		if (layout.mapPointer != 0) {
+			// A filename can be found before the save/map has finished loading.
+			// Verify the map allocation and independent absolute coordinates
+			// before exposing any of this snapshot to the renderer.
+			uintptr_t mapbase = 0;
+			uint8_t originX = 0, originY = 0;
+			if (!W7_PC98MapBase(mapbase) ||
+				!mem_readb_checked(mapbase + 0x490 + newQuadrant, &originX) ||
+				!mem_readb_checked(mapbase + 0x4A0 + newQuadrant, &originY) ||
+				absX != originX + newQX || absY != originY + newQY) {
+				amw7_current_level = 0xFFFF;
+				amw7_need_update_once = true;
+				return;
+			}
 		}
 
 		const bool firstValidPoll = (amw7_current_level >= W7_LEVEL_COUNT);
