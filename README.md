@@ -15,7 +15,7 @@ game_version=pc9821
 PC-9821用として選択できていれば、ウィンドウタイトル末尾に `[PC-9821 Test 1 / F8]` が出ます。
 
 
-* * *
+*
 
 
 # Wizardry 7: Crusaders of the Dark Savant PC-9801版 External AutoMap v1.2
