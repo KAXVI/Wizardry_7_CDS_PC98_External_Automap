@@ -3,7 +3,8 @@
 PC-9821版 Wizardry 7: Crusaders of the Dark Savant 用に、現在位置・向き・マップ・踏破情報の読み取りを追加したテスト版です。/
 PC-9821版DS.EXEとnp21x64wの実行中データに基づいています。
 
-**EXEだけでなく、同梱のCONFも使用してください。** 同梱CONFの `[automap]` には次が入っています。
+**EXEだけでなく、同梱のCONFも使用してください。/
+** 同梱CONFの `[automap]` には次が入っています。
 
 ```ini
 game_version=pc9821
