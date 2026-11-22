@@ -20,6 +20,7 @@
 #include <commdlg.h>
 
 #include "src/wizardry_am/external_compat.h"
+#include "src/wizardry_am/ds_anchor.h"
 
 static_assert(sizeof(void*) == 8, "Wizardry7Automap must be built as a 64-bit executable.");
 
@@ -147,6 +148,13 @@ static constexpr size_t W7EA_SNAPSHOT_SIZE = 0x10000;
 static std::array<uint8_t, W7EA_SNAPSHOT_SIZE> s_pc98Snapshot = {};
 static uintptr_t s_pc98SnapshotBase = 0;
 static bool s_pc98SnapshotValid = false;
+struct ScanDiagnostics {
+    uint64_t bytesRead = 0;
+    uint64_t readFailures = 0;
+    uint64_t filenameMatches = 0;
+    uint64_t residentMatches = 0;
+};
+static ScanDiagnostics s_scanDiagnostics;
 
 static HWND s_nativeWindow = nullptr;
 static HWND s_statusOverlay = nullptr;
@@ -794,6 +802,7 @@ static void WriteDefaultAutomapConfig(const char* path)
                  "target14=\n"
                  "target15=\n"
                  "target16=\n"
+                 "game_version=pc9801\n"
                  "enable=true\n"
                  "show_tooltips=true\n"
                  "hide_in_dark_zones=true\n"
@@ -855,6 +864,10 @@ static void LoadAutomapConfig()
 
         if (targetIndex >= 0) {
             targetSlots[static_cast<size_t>(targetIndex)] = FileNameOnly(value);
+        } else if (key == "game_version") {
+            const std::string version = ToLowerString(UnquoteConfigValue(value));
+            if (version == "pc9821") amw7_pc98_layout = &W7_PC9821_LAYOUT;
+            else if (version == "pc9801") amw7_pc98_layout = &W7_PC9801_LAYOUT;
         } else if (key == "enable") {
             s_automapEnabled = ParseBoolValue(value, s_automapEnabled);
         } else if (key == "show_tooltips") {
@@ -1154,7 +1167,9 @@ void AM_DrawW7Sprite(int x, int y, int w, int h,
 void SetAutomapWindowTitle(const char* title)
 {
     if (!s_nativeWindow) return;
-    const std::wstring wide = Utf8ToWide(title ? title : "Wizardry7Automap");
+    std::string display = title ? title : "Wizardry7Automap";
+    if (amw7_pc98_layout == &W7_PC9821_LAYOUT) display += " [PC-9821 Test 1 / F8]";
+    const std::wstring wide = Utf8ToWide(display);
     SetWindowTextW(s_nativeWindow, wide.c_str());
 }
 
@@ -1354,8 +1369,7 @@ static bool RefreshPC98Snapshot()
         return false;
     }
 
-    static constexpr char kDsExeAnchor[] = "a:ds.exe";
-    if (std::memcmp(s_pc98Snapshot.data(), kDsExeAnchor, sizeof(kDsExeAnchor) - 1) != 0) {
+    if (!W7_IsDsExeAnchor(s_pc98Snapshot.data(), s_pc98Snapshot.size())) {
         RegisterDsExeAnchorFailure();
         return false;
     }
@@ -1578,11 +1592,11 @@ static bool FindWizardry7Layout(HANDLE process, uintptr_t& anchor, uintptr_t& da
 
     anchor = 0;
     dataSeg = 0;
+    s_scanDiagnostics = {};
 
-    const char* dsAnchor = "a:ds.exe";
     const char* vmaze = "VMAZE";
     const char* stackOverflow = "STACK OVERFLOW";
-    const size_t dsLen = 8;
+    const size_t dsLen = 9; // includes the resident filename's terminating NUL
     const size_t chunkSize = 1u << 20; // 1 MB
     const size_t overlap = 256;
 
@@ -1607,10 +1621,12 @@ static bool FindWizardry7Layout(HANDLE process, uintptr_t& anchor, uintptr_t& da
                 std::vector<char> buf(toRead + overlap);
                 SIZE_T got = 0;
                 if (ReadProcessMemory(process, (LPCVOID)(base + offset), buf.data(), toRead, &got) && got >= dsLen) {
+                    s_scanDiagnostics.bytesRead += got;
                     size_t limit = (size_t)got >= dsLen ? (size_t)got - dsLen + 1 : 0;
                     for (size_t i = 0; i < limit; ++i) {
-                        if (std::memcmp(buf.data() + i, dsAnchor, dsLen) != 0)
+                        if (!W7_IsDsExeAnchor(buf.data() + i, dsLen))
                             continue;
+                        ++s_scanDiagnostics.filenameMatches;
 
                         uintptr_t candidate = base + offset + i;
 
@@ -1618,11 +1634,14 @@ static bool FindWizardry7Layout(HANDLE process, uintptr_t& anchor, uintptr_t& da
                         if (!VerifyDsExeResidentData(process, candidate, vmaze, stackOverflow)) {
                             continue;
                         }
+                        ++s_scanDiagnostics.residentMatches;
 
                         anchor = candidate;
                         dataSeg = candidate; // PC-98 mode: the renderer uses amw7_pc98_anchor-relative offsets.
                         return true;
                     }
+                } else {
+                    ++s_scanDiagnostics.readFailures;
                 }
                 if (toRead <= overlap) break;
                 offset += (toRead - overlap);
@@ -1649,6 +1668,7 @@ static void DetachFromProcess()
         s_process = nullptr;
     }
     s_gameAttached = false;
+    s_scanDiagnostics = {};
     s_attachedTargetProcessName.clear();
     s_dsAnchorFailureCount = 0;
     s_pc98SnapshotValid = false;
@@ -1735,6 +1755,94 @@ static void DrawStatusScreen()
     ShowStatusOverlay(true);
 }
 
+// F8 captures only the same resident-data window used by the renderer. It
+// neither writes to the emulator nor exports its entire process memory.
+static bool WriteNewDiagnosticFile(const std::wstring& path, const void* data, DWORD size)
+{
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                              CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const bool ok = WriteFile(file, data, size, &written, nullptr) && written == size;
+    const bool closed = CloseHandle(file) != FALSE;
+    if (!ok || !closed) DeleteFileW(path.c_str());
+    return ok && closed;
+}
+
+static void SavePC98Diagnostic(HWND owner)
+{
+    // Read a fresh snapshot, rather than silently exporting a previous frame.
+    const bool hasSnapshot = s_gameAttached && RefreshPC98Snapshot();
+    const uintptr_t capturedAnchor = hasSnapshot ? s_pc98SnapshotBase : 0;
+    const std::array<uint8_t, W7EA_SNAPSHOT_SIZE> captured = s_pc98Snapshot;
+    SYSTEMTIME time = {};
+    GetLocalTime(&time);
+    wchar_t prefix[256] = {};
+    std::swprintf(prefix, sizeof(prefix) / sizeof(prefix[0]),
+                  L"Config\\Diagnostics\\W7_%04u%02u%02u_%02u%02u%02u_%llu",
+                  time.wYear, time.wMonth, time.wDay,
+                  time.wHour, time.wMinute, time.wSecond,
+                  static_cast<unsigned long long>(GetTickCount64()));
+    const std::wstring reportPath = std::wstring(prefix) + L".txt";
+    const std::wstring snapshotPath = std::wstring(prefix) + L".bin";
+
+    char report[4096] = {};
+    const int count = std::snprintf(report, sizeof(report),
+        "Wizardry7Automap PC-9821 Test 1\r\n"
+        "target=%s\r\npid=%lu\r\nstatus=%s\r\n"
+        "snapshot=%s\r\nanchor=0x%llX\r\nsnapshot_size=%u\r\n"
+        "last_scan_bytes=%llu\r\nlast_scan_read_failures=%llu\r\n"
+        "last_scan_filename_matches=%llu\r\nlast_scan_resident_matches=%llu\r\n"
+        "renderer_layout=%s\r\n",
+        s_attachedTargetProcessName.c_str(),
+        static_cast<unsigned long>(s_process ? GetProcessId(s_process) : 0),
+        s_statusText.c_str(), hasSnapshot ? "yes" : "no",
+        static_cast<unsigned long long>(capturedAnchor),
+        hasSnapshot ? static_cast<unsigned>(captured.size()) : 0u,
+        static_cast<unsigned long long>(s_scanDiagnostics.bytesRead),
+        static_cast<unsigned long long>(s_scanDiagnostics.readFailures),
+        static_cast<unsigned long long>(s_scanDiagnostics.filenameMatches),
+        static_cast<unsigned long long>(s_scanDiagnostics.residentMatches),
+        amw7_pc98_layout->name);
+    if (count < 0 || static_cast<size_t>(count) >= sizeof(report)) return;
+    std::string text(report, static_cast<size_t>(count));
+    if (hasSnapshot) {
+        text += "Raw little-endian words, offsets relative to anchor:\r\n";
+        const auto& layout = *amw7_pc98_layout;
+        for (const size_t offset : {layout.level, layout.quadrant, layout.qX,
+                                   layout.qY, layout.absX, layout.absY,
+                                   layout.direction, layout.visited,
+                                   layout.mapPointer}) {
+            const unsigned value = captured[offset] | (captured[offset + 1] << 8);
+            char line[64] = {};
+            std::snprintf(line, sizeof(line), "  +%04X = %04X (%u)\r\n",
+                          static_cast<unsigned>(offset), value, value);
+            text += line;
+        }
+    }
+
+    CreateDirectoryW(L"Config", nullptr);
+    CreateDirectoryW(L"Config\\Diagnostics", nullptr);
+    bool ok = !hasSnapshot || WriteNewDiagnosticFile(
+        snapshotPath, captured.data(), static_cast<DWORD>(captured.size()));
+    if (ok) {
+        ok = WriteNewDiagnosticFile(reportPath, text.data(), static_cast<DWORD>(text.size()));
+        if (!ok && hasSnapshot) DeleteFileW(snapshotPath.c_str());
+    }
+    if (!ok) {
+        MessageBoxW(owner, L"Could not save diagnostics in Config\\Diagnostics.",
+                    L"Wizardry7Automap diagnostics", MB_OK | MB_ICONERROR);
+        return;
+    }
+    std::wstring message = L"Saved:\n" + reportPath;
+    if (hasSnapshot) {
+        message += L"\n" + snapshotPath;
+    } else {
+        message += L"\n\nNo fresh DS.EXE snapshot was available. The report contains detection status.";
+    }
+    MessageBoxW(owner, message.c_str(), L"Wizardry7Automap diagnostics", MB_OK | MB_ICONINFORMATION);
+}
+
 static void DrawAutomapFrame()
 {
     ShowStatusOverlay(false);
@@ -1819,6 +1927,13 @@ static void PaintMainWindow(HWND hwnd, HDC hdc)
 static LRESULT CALLBACK MainWindowWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    case WM_KEYDOWN:
+        if (wp == VK_F8) {
+            if ((lp & (static_cast<LPARAM>(1) << 30)) == 0) SavePC98Diagnostic(hwnd);
+            return 0;
+        }
+        break;
+
     case WM_ERASEBKGND:
         return 1;
 
