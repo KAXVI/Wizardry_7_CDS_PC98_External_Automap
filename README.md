@@ -1,3 +1,19 @@
+# PC-9821対応テスト版1
+
+PC-9821版 Wizardry 7: Crusaders of the Dark Savant 用に、現在位置・向き・マップ・踏破情報の読み取りを追加したテスト版です。
+PC-9821版DS.EXEとnp21x64wの実行中データに基づいています。
+
+**EXEだけでなく、同梱のCONFも使用してください。** 同梱CONFの `[automap]` には次が入っています。
+
+```ini
+game_version=pc9821
+```
+
+既存のCONFを引き継ぐ場合は、この1行を追加してください。
+指定がない場合や `game_version=pc9801` の場合は、従来のPC-9801版用アドレスを使います。
+PC-9821用として選択できていれば、ウィンドウタイトル末尾に `[PC-9821 Test 1 / F8]` が出ます。
+
+
 # Wizardry 7: Crusaders of the Dark Savant PC-9801版 External AutoMap v1.2
 
 ## 概要
